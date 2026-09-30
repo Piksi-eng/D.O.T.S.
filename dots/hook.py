@@ -107,9 +107,11 @@ def handle(payload: dict, started: float) -> None:
         rec["state"] = state
         rec["state_at"] = started
         rec["detail"] = detail_for(event, payload)
-    if event in REFRESH_HOST_EVENTS or not rec.get("host"):
+    old = rec.get("host") or {}
+    # On Windows keep looking for the terminal until one turns up: a background
+    # job has none until the terminal that sent it away is known.
+    if event in REFRESH_HOST_EVENTS or not old or (host.IS_WINDOWS and not old.get("hwnd")):
         fresh = host.describe_host()
-        old = rec.get("host") or {}
         if not fresh.get("hwnd") and old.get("hwnd"):
             fresh["hwnd"] = old["hwnd"]
         rec["host"] = fresh

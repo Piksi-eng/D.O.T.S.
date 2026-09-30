@@ -178,11 +178,17 @@ class SessionModel(QObject):
             self.usage_changed.emit()
 
     def prune_dead(self) -> None:
-        """Forget sessions whose Claude process is gone (terminal closed)."""
+        """Forget sessions whose Claude process or terminal window is gone, or that
+        Claude Code says are no longer sessions of their own."""
         now = time.time()
         for key, rec in list(self.sessions.items()):
             h = rec.get("host") or {}
             pid, name = h.get("claude_pid"), h.get("claude_name")
+            proc = host.claude_process(pid)
+            # Sent to the background: it goes on as a job with its own dot.
+            parked = bool(proc.get("parkedJobId")) and proc.get("sessionId") == rec.get("session_id")
+            # Started ahead of time in case you dispatch a background job.
+            spare = bool(proc.get("spare")) and rec.get("state") == store.IDLE
             dead = False
             if pid and psutil is not None:
                 try:
@@ -194,7 +200,7 @@ class SessionModel(QObject):
                     dead = False
             elif now - rec.get("updated_at", now) > STALE_AFTER:
                 dead = True
-            if dead:
+            if dead or parked or spare or host.terminal_closed(h):
                 self.forget(key)
 
     # ---- actions
@@ -336,6 +342,7 @@ class Dot(QWidget):
         self.context = None  # % of the context window used, from the status line
         self.look = (GREEN, 1.0, False, False)
         self.hover = False
+        self._press = None  # where a left click started, until it drags or lands
         self.setFixedSize(self.SIZE)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
@@ -352,8 +359,25 @@ class Dot(QWidget):
         self.hover = False
         self.update()
 
+    def mousePressEvent(self, event):
+        # Keep the press: passed on to the widget it starts a window drag, and
+        # Windows swallows the release that ends it, so the click never lands.
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press = event.position()
+
+    def mouseMoveEvent(self, event):
+        # Dragging from a dot still moves the widget.
+        if (self._press is not None and (event.position() - self._press).manhattanLength()
+                >= QApplication.startDragDistance()):
+            self._press = None
+            handle = self.window().windowHandle()
+            if handle:
+                handle.startSystemMove()
+
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+        pressed, self._press = self._press, None
+        if (pressed is not None and event.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(event.position().toPoint())):
             self.clicked.emit(self.key)
 
     def contextMenuEvent(self, event):
@@ -407,6 +431,40 @@ class Dot(QWidget):
                        f"{self.context:.0f}%")
 
 
+class Chevron(QToolButton):
+    """A small painted chevron: down while its section is open, right when folded."""
+
+    def __init__(self):
+        super().__init__()
+        self.open = True
+        self.setFixedSize(16, 12)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_open(self, on: bool) -> None:
+        self.open = on
+        self.update()
+
+    def enterEvent(self, _):
+        self.update()
+
+    def leaveEvent(self, _):
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(ORANGE_HI if self.underMouse() else MUTED, 1.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        if self.open:  # pointing down
+            points = [QPointF(-3.5, -1.75), QPointF(0, 1.75), QPointF(3.5, -1.75)]
+        else:  # pointing right
+            points = [QPointF(-1.75, -3.5), QPointF(1.75, 0), QPointF(-1.75, 3.5)]
+        p.drawPolyline([c + q for q in points])
+
+
 def chrome_button(text: str, tip: str) -> QToolButton:
     b = QToolButton()
     b.setObjectName("chrome")
@@ -428,6 +486,7 @@ class DotsWidget(QWidget):
         self.dots = {}
         self._fg = None
         self._fg_since = 0.0
+        self._last_fg = None  # the window in front before you clicked the widget
 
         root = QVBoxLayout(self)
         root.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
@@ -458,17 +517,28 @@ class DotsWidget(QWidget):
         root.addLayout(header)
 
         # meters
+        self.meters = QWidget()
+        meters = QVBoxLayout(self.meters)
+        meters.setContentsMargins(0, 0, 0, 0)
+        meters.setSpacing(root.spacing())
         self.five_hour = Meter("5H", "5-hour session limit")
         self.seven_day = Meter("WEEK", "Weekly limit")
         for m in (self.five_hour, self.seven_day):
             m.setFixedWidth(WIDTH - 28)
-            root.addWidget(m)
+            meters.addWidget(m)
+        root.addWidget(self.meters)
 
+        # the rule under the meters carries the button that folds them away
+        fold_row = QHBoxLayout()
+        fold_row.setSpacing(4)
         rule = QWidget()
         rule.setFixedHeight(1)
         rule.setStyleSheet("background: rgba(255,138,31,38);")
-        root.addSpacing(2)
-        root.addWidget(rule)
+        self.fold = Chevron()
+        self.fold.clicked.connect(lambda: self._show_meters(self.meters.isHidden()))
+        fold_row.addWidget(rule, 1)
+        fold_row.addWidget(self.fold)
+        root.addLayout(fold_row)
 
         # dots
         self.grid_host = QWidget()
@@ -516,6 +586,7 @@ class DotsWidget(QWidget):
 
         self.opacity.setValue(int(self.cfg.get("opacity", 92)))
         self._set_opacity(self.opacity.value())
+        self._show_meters(self.cfg.get("meters", True))
 
         # timers
         self.anim = QTimer(self, interval=33, timeout=self._animate)
@@ -563,6 +634,10 @@ class DotsWidget(QWidget):
         menu = QMenu(self)
         menu.addAction("Mark all as read", self.model.mark_all_seen)
         menu.addSeparator()
+        meters = menu.addAction("Usage meters")
+        meters.setCheckable(True)
+        meters.setChecked(not self.meters.isHidden())
+        meters.toggled.connect(self._show_meters)
         settings = menu.addAction("Settings")
         settings.setCheckable(True)
         settings.setChecked(self.gear.isChecked())
@@ -577,6 +652,28 @@ class DotsWidget(QWidget):
             self.autostart_box.blockSignals(True)
             self.autostart_box.setChecked(autostart.is_enabled())
             self.autostart_box.blockSignals(False)
+
+    def _show_meters(self, on: bool):
+        self.meters.setVisible(on)
+        self.fold.set_open(on)
+        self._fold_tooltip()
+        if self.cfg.get("meters", True) != on:
+            self.cfg["meters"] = on
+            self._save_cfg()
+
+    def _fold_tooltip(self):
+        """Collapsed meters still show their numbers on hover."""
+        if not self.meters.isHidden():
+            self.fold.setToolTip("Hide usage meters")
+            return
+        parts = []
+        for m in (self.five_hour, self.seven_day):
+            pct = "--" if m.pct is None else f"{m.pct:.0f}%"
+            text = f"{m.label} {pct}"
+            if m.resets_at:
+                text += f" · resets in {short_duration(m.resets_at - time.time())}"
+            parts.append(text)
+        self.fold.setToolTip("<b>Show usage meters</b><br>" + "<br>".join(parts))
 
     def _set_opacity(self, value: int):
         self.setWindowOpacity(value / 100)
@@ -606,17 +703,20 @@ class DotsWidget(QWidget):
 
     def _save_cfg(self):
         cfg = store.load_config()  # keep keys other tools wrote (install.py)
-        cfg.update({k: self.cfg[k] for k in ("opacity", "pos") if k in self.cfg})
+        cfg.update({k: self.cfg[k] for k in ("opacity", "pos", "meters") if k in self.cfg})
         store.save_config(cfg)
 
     # ---- data
     def _tick(self):
         self.model.poll()
-        self._auto_seen()
-
-    def _auto_seen(self):
-        """A terminal you keep focused counts as read (when it hosts one session)."""
         fg = host.foreground_window()
+        # Clicking the widget brings it to the front, so remember what was there.
+        if fg and QApplication.applicationState() != Qt.ApplicationState.ApplicationActive:
+            self._last_fg = fg
+        self._auto_seen(fg)
+
+    def _auto_seen(self, fg):
+        """A terminal you keep focused counts as read (when it hosts one session)."""
         if not fg or fg == int(self.winId()):
             self._fg = None
             return
@@ -677,6 +777,7 @@ class DotsWidget(QWidget):
     def refresh_usage(self):
         self.five_hour.set_window(self.model.usage.get("five_hour"))
         self.seven_day.set_window(self.model.usage.get("seven_day"))
+        self._fold_tooltip()
         for key, dot in self.dots.items():  # keep "3m ago" fresh
             dot.setToolTip(self._tooltip(key))
 
@@ -708,7 +809,7 @@ class DotsWidget(QWidget):
         if extras:
             lines.append(" · ".join(extras))
         lines.append(f"<span style='color:#8c8076'>{html.escape(rec.get('cwd') or '')}</span>")
-        lines.append("<span style='color:#6d625a'>Click: open terminal · right-click: more</span>")
+        lines.append("<span style='color:#6d625a'>Click: open terminal, again to minimize · right-click: more</span>")
         return "<br>".join(lines)
 
     def _animate(self):
@@ -718,8 +819,19 @@ class DotsWidget(QWidget):
 
     # ---- dot actions
     def _dot_clicked(self, key: str):
-        rec = self.model.sessions.get(key) or {}
-        host.focus(rec.get("host") or {})
+        """Open a session's terminal, or minimize it when it is already in front."""
+        window = host.terminal_window((self.model.sessions.get(key) or {}).get("host") or {})
+        if window and window == self._last_fg:
+            host.minimize(window)
+            self._last_fg = None
+            self.model.mark_seen(key)
+        else:
+            self._open(key)
+
+    def _open(self, key: str):
+        h = (self.model.sessions.get(key) or {}).get("host") or {}
+        if host.focus(h):
+            self._last_fg = host.terminal_window(h)  # a quick second click minimizes
         self.model.mark_seen(key)
 
     def _dot_menu(self, key: str, pos: QPoint):
@@ -727,7 +839,7 @@ class DotsWidget(QWidget):
         menu = QMenu(self)
         head = menu.addAction(rec.get("project") or "session")
         head.setEnabled(False)
-        menu.addAction("Open terminal", lambda: self._dot_clicked(key))
+        menu.addAction("Open terminal", lambda: self._open(key))
         read = menu.addAction("Mark as read", lambda: self.model.mark_seen(key))
         read.setEnabled(self.model.needs_attention(key))
         menu.addAction("Remove dot", lambda: self.model.forget(key))
