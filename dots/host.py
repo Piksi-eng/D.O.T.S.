@@ -3,6 +3,7 @@
 Stdlib only (ctypes on Windows) so the hook stays fast and dependency free.
 Everything here is best effort: any failure returns None/False.
 """
+import json
 import os
 import subprocess
 import sys
@@ -58,6 +59,7 @@ if IS_WINDOWS:
     _TH32CS_SNAPPROCESS = 0x2
     _GW_OWNER = 4
     _GA_ROOTOWNER = 3
+    _SW_MINIMIZE = 6
     _SW_RESTORE = 9
     _VK_MENU = 0x12
     _KEYEVENTF_KEYUP = 0x2
@@ -167,19 +169,63 @@ def _console_host(console):
     return None
 
 
-def _borrowed_console_host(pid: int):
-    """The window showing another process's console. Hooks run without a console
-    of their own, so briefly attach to Claude's to ask which window hosts it."""
+def _console_of(pid: int):
+    """Another process's console window, asked for by briefly attaching to it."""
     _kernel32.FreeConsole()
     if not _kernel32.AttachConsole(pid):
         return None
     try:
-        return _console_host(_kernel32.GetConsoleWindow())
+        return _kernel32.GetConsoleWindow()
     finally:
         _kernel32.FreeConsole()
 
 
-def find_window(chain: list, claude_pid: int = None):
+def _claude_console(claude_pid: int = None):
+    """Claude's console window: ours when we share it. Hooks run without a console
+    of their own, so otherwise ask Claude's."""
+    console = _kernel32.GetConsoleWindow()
+    if console or not claude_pid:
+        return console
+    return _console_of(claude_pid)
+
+
+def _claude_sessions_dir() -> str:
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "sessions")
+
+
+def claude_process(pid) -> dict:
+    """What Claude Code says one of its processes is doing, from the file it keeps
+    for it: session id, "kind" ("bg" under its daemon), background job id..."""
+    if not pid:
+        return {}
+    try:
+        with open(os.path.join(_claude_sessions_dir(), f"{pid}.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _parked_terminal(job_id):
+    """The terminal a background job was sent away from, which goes on
+    showing it: the one whose Claude lists the job as parked."""
+    if not (IS_WINDOWS and job_id):
+        return None
+    try:
+        names = os.listdir(_claude_sessions_dir())
+    except OSError:
+        return None
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext == ".json" and stem.isdigit() and claude_process(stem).get("parkedJobId") == job_id:
+            found = _console_host(_console_of(int(stem)))
+            if found:
+                return found
+    return None
+
+
+def find_window(chain: list, console=None):
     """The top-level window hosting this process tree (Windows only)."""
     if not IS_WINDOWS:
         return None
@@ -191,19 +237,14 @@ def find_window(chain: list, claude_pid: int = None):
     fg = _user32.GetForegroundWindow()
     if fg and _window_pid(fg) in pids:
         return int(fg)
-    # 2. Our console window, or the terminal that owns the pseudo console
-    #    (Windows Terminal, VS Code).
-    console = _kernel32.GetConsoleWindow()
+    # 2. The window showing Claude's console: the terminal that owns its pseudo
+    #    console (Windows Terminal, VS Code), or the classic console window. With
+    #    Windows Terminal as the default terminal it hosts the session without
+    #    being one of our ancestors.
     found = _console_host(console)
     if found:
         return found
-    # 3. The same, for Claude's console. With Windows Terminal as the default
-    #    terminal it hosts the session without being one of our ancestors.
-    if claude_pid and not console:
-        found = _borrowed_console_host(claude_pid)
-        if found:
-            return found
-    # 4. The nearest ancestor that owns a window.
+    # 3. The nearest ancestor that owns a window.
     windows = _top_windows()
     for pid in pids:
         if windows.get(pid):
@@ -216,11 +257,26 @@ def describe_host() -> dict:
     chain = ancestors()
     info = {}
     claude = find_claude(chain)
+    proc = {}
     if claude:
         info["claude_pid"], info["claude_name"] = claude
-    try:
-        hwnd = find_window(chain, info.get("claude_pid"))
-    except Exception:  # never let window lookup break the hook
+        proc = claude_process(claude[0])
+        if proc.get("kind") == "bg":
+            info["background"] = True  # runs under Claude's daemon, not in a terminal
+    try:  # never let window lookup break the hook
+        console = _claude_console(info.get("claude_pid")) if IS_WINDOWS else None
+        if info.get("background"):
+            # Its console is hidden and its ancestors are the daemon's, so look
+            # for the terminal that sent it to the background instead.
+            hwnd = _parked_terminal(proc.get("jobId"))
+        else:
+            hwnd = find_window(chain, console)
+        if console:
+            info["console"] = int(console)
+            owner = _user32.GetWindow(console, _GW_OWNER)
+            if owner:  # the terminal window showing this pseudo console
+                info["console_owner"] = int(owner)
+    except Exception:
         hwnd = None
     if hwnd:
         info["hwnd"] = hwnd
@@ -242,10 +298,45 @@ def window_exists(hwnd) -> bool:
     return bool(IS_WINDOWS and hwnd and _user32.IsWindow(hwnd))
 
 
+def terminal_closed(host: dict) -> bool:
+    """True once the window showing a session is gone. Windows Terminal can close
+    a window and leave the Claude inside it running with no window at all, so a
+    live Claude process does not mean the terminal is still open."""
+    if not IS_WINDOWS or host.get("background"):  # background jobs outlive terminals
+        return False
+    console = host.get("console")
+    if console:
+        if not window_exists(console):
+            return True
+        # A pseudo console is owned by the terminal window showing it and is
+        # left without an owner when that window closes.
+        return bool(host.get("console_owner")) and not window_exists(_user32.GetWindow(console, _GW_OWNER))
+    hwnd = host.get("hwnd")
+    return bool(hwnd) and not window_exists(hwnd)
+
+
+def terminal_window(host: dict):
+    """The window showing a session right now. Ask the console first: a Windows
+    Terminal tab dragged to another window leaves the recorded window stale."""
+    console = host.get("console")
+    if window_exists(console):
+        found = _console_host(console)
+        if found:
+            return found
+    hwnd = host.get("hwnd")
+    return hwnd if window_exists(hwnd) else None
+
+
+def minimize(hwnd) -> None:
+    """Minimize a window; Windows then activates the next one in line."""
+    if window_exists(hwnd):
+        _user32.ShowWindow(hwnd, _SW_MINIMIZE)
+
+
 def focus(host: dict) -> bool:
     """Bring a session's terminal to the front."""
-    hwnd = host.get("hwnd")
-    if IS_WINDOWS and window_exists(hwnd):
+    hwnd = terminal_window(host)
+    if hwnd:
         if _user32.IsIconic(hwnd):
             _user32.ShowWindow(hwnd, _SW_RESTORE)
         if _user32.SetForegroundWindow(hwnd):

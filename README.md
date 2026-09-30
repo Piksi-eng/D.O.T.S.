@@ -18,14 +18,15 @@ when you log in.
 | 🔴 blinking red | The turn failed (API error, rate limit, overloaded...). Steady red once read |
 
 **Marking a session as read:** click its dot. That brings its terminal window to the front and
-marks it read. On Windows, a finished session also counts as read once you keep its terminal
+marks it read. Click the dot again while its terminal is in front to minimize it. On Windows, a finished session also counts as read once you keep its terminal
 window focused for 1.5 seconds. This only works when that window holds just that one Claude
 session; with several sessions as tabs in one window, click the dot instead.
 
 Hover a dot to see the project, what it's doing, how long ago, the model and how full its context
 is. Right-click a dot to open it, mark it read, or remove it. Right-click anywhere else for
 "Mark all as read" and Quit. Drag the widget anywhere; it remembers where you put it.
-The ⚙ button shows the **opacity slider** and the **start on login** switch.
+The ⚙ button shows the **opacity slider** and the **start on login** switch. The small arrow under
+the usage meters folds them away; hover it to still see the numbers.
 
 ## Install (Windows, also works on macOS and Linux)
 
@@ -81,7 +82,13 @@ Claude Code status line ─────▶ dots/statusline.py ──▶ ~/.dots/
 * **Which window to focus:** when you start a session or send a prompt, the hook records the
   terminal window (Windows Terminal, VS Code, conhost...) that owns it.
 * **Closed terminals:** the widget checks every few seconds that each session's Claude process is
-  still alive and drops dots for sessions whose process has exited.
+  still alive and drops dots for sessions whose process has exited. It also drops a session whose
+  terminal window is gone, because Windows Terminal can close a window and leave the Claude
+  inside it running with no window at all.
+* **Background sessions** (`claude --bg`, `claude agents`) get a dot too. When you send a
+  session to the background from a terminal, its dot moves to the background job and clicking it
+  opens that terminal. Spare sessions Claude Code starts ahead of time don't get a dot until you
+  use them.
 * **Usage meters** show the `rate_limits` data Claude Code passes to the status line (Pro and Max
   plans). The meters fill in after your first message in any session. Claude has no daily limit:
   the limits are a rolling **5-hour** window and a **weekly** one, so those are the two meters.
