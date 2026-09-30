@@ -8,6 +8,8 @@ import subprocess
 import sys
 
 IS_WINDOWS = sys.platform == "win32"
+# Ancestors whose windows are never the terminal (see find_window).
+_NOT_TERMINALS = {"explorer"}
 
 if IS_WINDOWS:
     import ctypes
@@ -36,6 +38,7 @@ if IS_WINDOWS:
     _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.GetConsoleWindow.restype = wintypes.HWND
+    _kernel32.AttachConsole.argtypes = [wintypes.DWORD]
 
     _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     _user32.EnumWindows.argtypes = [_EnumWindowsProc, wintypes.LPARAM]
@@ -151,11 +154,38 @@ def _window_pid(hwnd) -> int:
     return pid.value
 
 
-def find_window(chain: list):
+def _console_host(console):
+    """The visible window showing a console: the terminal that owns its pseudo
+    console (Windows Terminal, VS Code), or the classic console window itself."""
+    if not console:
+        return None
+    root = _user32.GetAncestor(console, _GA_ROOTOWNER)
+    if root and root != console and _user32.IsWindowVisible(root):
+        return int(root)
+    if _user32.IsWindowVisible(console):
+        return int(console)
+    return None
+
+
+def _borrowed_console_host(pid: int):
+    """The window showing another process's console. Hooks run without a console
+    of their own, so briefly attach to Claude's to ask which window hosts it."""
+    _kernel32.FreeConsole()
+    if not _kernel32.AttachConsole(pid):
+        return None
+    try:
+        return _console_host(_kernel32.GetConsoleWindow())
+    finally:
+        _kernel32.FreeConsole()
+
+
+def find_window(chain: list, claude_pid: int = None):
     """The top-level window hosting this process tree (Windows only)."""
     if not IS_WINDOWS:
         return None
-    pids = [pid for pid, _ in chain]
+    # The shell is an ancestor when a terminal is started from Explorer (typing
+    # "cmd" in the address bar, "Open in Terminal"), but its windows never host us.
+    pids = [pid for pid, name in chain if _base(name) not in _NOT_TERMINALS]
     # 1. The foreground window, if it belongs to our tree: at SessionStart and
     #    UserPromptSubmit that is the terminal you just typed in.
     fg = _user32.GetForegroundWindow()
@@ -164,13 +194,16 @@ def find_window(chain: list):
     # 2. Our console window, or the terminal that owns the pseudo console
     #    (Windows Terminal, VS Code).
     console = _kernel32.GetConsoleWindow()
-    if console:
-        root = _user32.GetAncestor(console, _GA_ROOTOWNER)
-        if root and root != console and _user32.IsWindowVisible(root):
-            return int(root)
-        if _user32.IsWindowVisible(console):
-            return int(console)
-    # 3. The nearest ancestor that owns a window.
+    found = _console_host(console)
+    if found:
+        return found
+    # 3. The same, for Claude's console. With Windows Terminal as the default
+    #    terminal it hosts the session without being one of our ancestors.
+    if claude_pid and not console:
+        found = _borrowed_console_host(claude_pid)
+        if found:
+            return found
+    # 4. The nearest ancestor that owns a window.
     windows = _top_windows()
     for pid in pids:
         if windows.get(pid):
@@ -186,7 +219,7 @@ def describe_host() -> dict:
     if claude:
         info["claude_pid"], info["claude_name"] = claude
     try:
-        hwnd = find_window(chain)
+        hwnd = find_window(chain, info.get("claude_pid"))
     except Exception:  # never let window lookup break the hook
         hwnd = None
     if hwnd:
