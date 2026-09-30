@@ -162,6 +162,7 @@ class SessionModel(QObject):
             status = store.read_json(path.with_suffix(".status"))
             if isinstance(status, dict) and status != self.status.get(key):
                 self.status[key] = status
+                changed = True  # context % is drawn under the dot
         if changed:
             self.changed.emit()
         self._poll_usage()
@@ -326,12 +327,13 @@ class Dot(QWidget):
     clicked = Signal(str)
     menu_requested = Signal(str, QPoint)
 
-    SIZE = QSize(46, 44)
+    SIZE = QSize(46, 55)
 
     def __init__(self, key: str):
         super().__init__()
         self.key = key
         self.label = ""
+        self.context = None  # % of the context window used, from the status line
         self.look = (GREEN, 1.0, False, False)
         self.hover = False
         self.setFixedSize(self.SIZE)
@@ -397,6 +399,12 @@ class Dot(QWidget):
         p.setPen(TEXT if (blink or self.hover) else MUTED)
         text = QFontMetrics(f).elidedText(self.label, Qt.TextElideMode.ElideRight, self.width() - 4)
         p.drawText(QRectF(0, 29, self.width(), 14), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, text)
+
+        if self.context is not None:
+            p.setFont(font(MONO, 6.8))
+            p.setPen(RED if self.context >= 90 else ORANGE if self.context >= 70 else MUTED)
+            p.drawText(QRectF(0, 42, self.width(), 12), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                       f"{self.context:.0f}%")
 
 
 def chrome_button(text: str, tip: str) -> QToolButton:
@@ -638,6 +646,7 @@ class DotsWidget(QWidget):
         labels = self._labels(order)
         for key, dot in self.dots.items():
             dot.label = labels[key]
+            dot.context = self.model.status.get(key, {}).get("context")
             dot.look = self.model.look(key)
             dot.setToolTip(self._tooltip(key))
             dot.update()
